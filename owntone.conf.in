@@ -264,7 +264,7 @@ audio {
 	# Name - used in the speaker list in Remote
 	nickname = "Computer"
 
-	# Type of the output (alsa, pulseaudio, dummy or disabled)
+	# Type of the output (alsa, pulseaudio, pipewire, dummy or disabled)
 #	type = "alsa"
 
 	# For pulseaudio output, an optional server hostname or IP can be
@@ -275,13 +275,23 @@ audio {
 	# Audio PCM device name for local audio output - ALSA only
 #	card = "default"
 
-	# Mixer channel to use for volume control - ALSA only
-	# If not set, PCM will be used if available, otherwise Master.
+	# Mixer to use for volume control. For ALSA, if not set, PCM will be used
+	# if available, otherwise Master. For PipeWire, "pwsink" controls the
+	# PipeWire/WirePlumber sink volume, while "pwstream" controls only the
+	# OwnTone stream volume.
 #	mixer = ""
 
 	# Mixer device to use for volume control - ALSA only
 	# If not set, the value for "card" will be used.
 #	mixer_device = ""
+
+	# Optional PipeWire sink node.name used for volume control in pwsink mode.
+	# If not set, empty or "default", the default WirePlumber sink is followed.
+#	pwsink_target = "default"
+
+	# PipeWire sink volume curve ("cubic" or "linear") used in pwsink mode.
+	# Defaults to "cubic".
+#	pwsink_volume_curve = "cubic"
 
 	# Enable or disable audio resampling to keep local audio in sync with
 	# e.g. Airplay. This feature relies on accurate ALSA measurements of
