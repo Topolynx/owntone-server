@@ -96,6 +96,7 @@
 #include "player.h"
 #include "outputs.h"
 #include "commands.h"
+#include "pipewire_stable_id.h"
 
 #include <pipewire/pipewire.h>
 #include <pipewire/extensions/metadata.h>
@@ -131,6 +132,15 @@
 
 /* ----------------------------- GLOBAL STATE ------------------------------- */
 
+struct pipewire_observed_sink
+{
+  uint32_t global_id;
+  uint64_t stable_id;
+  char *stable_key;
+  char *display_name;
+  struct pipewire_observed_sink *next;
+};
+
 struct pipewire_ctx
 {
   struct pw_thread_loop *thread_loop;
@@ -138,6 +148,9 @@ struct pipewire_ctx
   struct pw_core        *core;
 
   struct spa_hook        core_listener;
+  struct pw_registry    *registry;
+  struct spa_hook        registry_listener;
+  struct pipewire_observed_sink *observed_sinks;
 
   struct commands_base  *cmdbase;
 
@@ -1549,6 +1562,206 @@ static const struct pw_device_events device_events = {
   .param = on_device_param,
 };
 
+/* ---------------- STREAMING REGISTRY OBSERVATION (PW THREAD) ------------- */
+
+static void
+pipewire_observed_sink_free(struct pipewire_observed_sink *sink)
+{
+  if (!sink)
+    return;
+
+  free(sink->stable_key);
+  free(sink->display_name);
+  free(sink);
+}
+
+static void
+pipewire_observed_sinks_clear(void)
+{
+  struct pipewire_observed_sink *sink;
+  struct pipewire_observed_sink *next;
+
+  for (sink = pwctx.observed_sinks; sink; sink = next)
+    {
+      next = sink->next;
+      pipewire_observed_sink_free(sink);
+    }
+
+  pwctx.observed_sinks = NULL;
+}
+
+static void
+pipewire_registry_clear(void)
+{
+  if (pwctx.registry)
+    {
+      spa_hook_remove(&pwctx.registry_listener);
+      pw_proxy_destroy((struct pw_proxy *)pwctx.registry);
+      pwctx.registry = NULL;
+    }
+
+  pipewire_observed_sinks_clear();
+}
+
+static void
+on_pwctx_registry_global(void *data, uint32_t id, uint32_t permissions,
+                         const char *type, uint32_t version,
+                         const struct spa_dict *props)
+{
+  struct pipewire_observed_sink *sink;
+  const char *stable_key;
+  const char *display_name;
+  const char *media_class;
+  uint64_t stable_id;
+
+  (void)data;
+  (void)permissions;
+  (void)version;
+
+  if (!props || !spa_streq(type, PW_TYPE_INTERFACE_Node))
+    return;
+
+  media_class = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
+  if (!media_class || !spa_streq(media_class, "Audio/Sink"))
+    return;
+
+  stable_key = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+  if (!stable_key || stable_key[0] == '\0')
+    {
+      DPRINTF(E_WARN, L_LAUDIO,
+        "PipeWire sink ignored: global_id=%u has no node.name\n", id);
+      return;
+    }
+
+  stable_id = pipewire_stable_id_from_name(stable_key);
+  if (stable_id == 0)
+    {
+      DPRINTF(E_WARN, L_LAUDIO,
+        "PipeWire sink ignored: global_id=%u node.name='%s' has no stable ID\n",
+        id, stable_key);
+      return;
+    }
+
+  for (sink = pwctx.observed_sinks; sink; sink = sink->next)
+    {
+      if (sink->global_id == id)
+        {
+          if (!strcmp(sink->stable_key, stable_key))
+            return;
+
+          DPRINTF(E_LOG, L_LAUDIO,
+            "PipeWire sink ignored: duplicate global_id=%u for node.name='%s' and node.name='%s'\n",
+            id, sink->stable_key, stable_key);
+          return;
+        }
+
+      if (!strcmp(sink->stable_key, stable_key))
+        {
+          DPRINTF(E_WARN, L_LAUDIO,
+            "PipeWire sink runtime ID changed: node.name='%s' global_id=%u -> global_id=%u\n",
+            stable_key, sink->global_id, id);
+          sink->global_id = id;
+          return;
+        }
+
+      if (sink->stable_id == stable_id)
+        {
+          DPRINTF(E_LOG, L_LAUDIO,
+            "PipeWire stable ID collision: stable_id=%" PRIu64 " node.name='%s' conflicts with node.name='%s'\n",
+            stable_id, sink->stable_key, stable_key);
+          return;
+        }
+    }
+
+  display_name = spa_dict_lookup(props, PW_KEY_NODE_DESCRIPTION);
+  if (!display_name || display_name[0] == '\0')
+    display_name = spa_dict_lookup(props, PW_KEY_NODE_NICK);
+  if (!display_name || display_name[0] == '\0')
+    display_name = stable_key;
+
+  sink = calloc(1, sizeof(*sink));
+  if (!sink)
+    {
+      DPRINTF(E_LOG, L_LAUDIO,
+        "PipeWire sink ignored: out of memory for node.name='%s'\n",
+        stable_key);
+      return;
+    }
+
+  sink->stable_key = strdup(stable_key);
+  sink->display_name = strdup(display_name);
+  if (!sink->stable_key || !sink->display_name)
+    {
+      DPRINTF(E_LOG, L_LAUDIO,
+        "PipeWire sink ignored: out of memory copying properties for node.name='%s'\n",
+        stable_key);
+      pipewire_observed_sink_free(sink);
+      return;
+    }
+
+  sink->global_id = id;
+  sink->stable_id = stable_id;
+  sink->next = pwctx.observed_sinks;
+  pwctx.observed_sinks = sink;
+
+  DPRINTF(E_LOG, L_LAUDIO,
+    "PipeWire sink discovered: global_id=%u stable_id=%" PRIu64 " node.name='%s' display='%s'\n",
+    sink->global_id, sink->stable_id, sink->stable_key, sink->display_name);
+}
+
+static void
+on_pwctx_registry_global_remove(void *data, uint32_t id)
+{
+  struct pipewire_observed_sink *sink;
+  struct pipewire_observed_sink *prev;
+
+  (void)data;
+
+  prev = NULL;
+  for (sink = pwctx.observed_sinks; sink; sink = sink->next)
+    {
+      if (sink->global_id == id)
+        break;
+      prev = sink;
+    }
+
+  if (!sink)
+    return;
+
+  if (prev)
+    prev->next = sink->next;
+  else
+    pwctx.observed_sinks = sink->next;
+
+  DPRINTF(E_LOG, L_LAUDIO,
+    "PipeWire sink removed: global_id=%u stable_id=%" PRIu64 " node.name='%s' display='%s'\n",
+    sink->global_id, sink->stable_id, sink->stable_key, sink->display_name);
+
+  pipewire_observed_sink_free(sink);
+}
+
+static const struct pw_registry_events pwctx_registry_events = {
+  PW_VERSION_REGISTRY_EVENTS,
+  .global        = on_pwctx_registry_global,
+  .global_remove = on_pwctx_registry_global_remove,
+};
+
+static int
+pipewire_registry_init(void)
+{
+  pwctx.registry = pw_core_get_registry(pwctx.core, PW_VERSION_REGISTRY, 0);
+  if (!pwctx.registry)
+    {
+      DPRINTF(E_LOG, L_LAUDIO,
+        "PipeWire: failed to get registry for sink observation\n");
+      return -1;
+    }
+
+  pw_registry_add_listener(pwctx.registry, &pwctx.registry_listener,
+                           &pwctx_registry_events, NULL);
+  return 0;
+}
+
 /* ----------------------- CORE CALLBACKS (PW THREAD) ----------------------- */
 
 static void
@@ -1600,6 +1813,7 @@ pipewire_core_reconnect(void)
   /* Tear down stale core */
   if (pwctx.core)
     {
+      pipewire_registry_clear();
       spa_hook_remove(&pwctx.core_listener);
       pw_core_disconnect(pwctx.core);
       pwctx.core = NULL;
@@ -1623,6 +1837,24 @@ pipewire_core_reconnect(void)
     }
 
   pw_core_add_listener(pwctx.core, &pwctx.core_listener, &core_events, NULL);
+
+  if (pipewire_registry_init() < 0)
+    {
+      spa_hook_remove(&pwctx.core_listener);
+      pw_core_disconnect(pwctx.core);
+      pwctx.core = NULL;
+      pw_thread_loop_unlock(pwctx.thread_loop);
+
+      DPRINTF(E_LOG, L_LAUDIO,
+        "PipeWire: registry reconnect failed -- will retry in %d ms\n",
+        PIPEWIRE_RECONNECT_MS);
+      struct timeval tv = {
+        .tv_sec  = PIPEWIRE_RECONNECT_MS / 1000,
+        .tv_usec = (PIPEWIRE_RECONNECT_MS % 1000) * 1000,
+      };
+      event_add(pwctx.reconnect_ev, &tv);
+      return;
+    }
 
   /* Sync to confirm the connection is live before touching streams */
   pwctx.core_seq = pw_core_sync(pwctx.core, PW_ID_CORE, 0);
@@ -1919,6 +2151,8 @@ pipewire_free(void)
   /* spa_hook_remove + pw_proxy_destroy must be called while the thread loop
    * is stopped (so no concurrent callbacks) but before pw_core_disconnect
    * (which invalidates all proxies). */
+  pipewire_registry_clear();
+
   if (pwctx.core)
     {
       spa_hook_remove(&pwctx.core_listener);
@@ -2741,6 +2975,12 @@ pipewire_init(void)
     }
 
   pw_core_add_listener(pwctx.core, &pwctx.core_listener, &core_events, NULL);
+
+  if (pipewire_registry_init() < 0)
+    {
+      pw_thread_loop_unlock(pwctx.thread_loop);
+      goto fail;
+    }
 
   /* Sync: wait for the initial core round-trip to complete. */
   pwctx.core_seq = pw_core_sync(pwctx.core, PW_ID_CORE, 0);
