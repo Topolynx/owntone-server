@@ -38,7 +38,12 @@ PULSEAUDIO_SRC=outputs/pulse.c
 endif
 
 if COND_PIPEWIRE
-PIPEWIRE_SRC=outputs/pipewire.c
+PIPEWIRE_SRC=outputs/pipewire.c outputs/pipewire_stable_id.c outputs/pipewire_stable_id.h
+check_PROGRAMS = pipewire_stable_id_test
+TESTS = $(check_PROGRAMS)
+pipewire_stable_id_test_SOURCES = \
+	outputs/pipewire_stable_id_test.c \
+	outputs/pipewire_stable_id.c outputs/pipewire_stable_id.h
 endif
 
 if COND_AVAHI
