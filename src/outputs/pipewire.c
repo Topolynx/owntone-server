@@ -21,11 +21,12 @@
  *
  * Architecture overview
  * ---------------------
- * OwnTone registers a single "PipeWire" output device and opens a pw_stream
- * with PW_ID_ANY (no explicit target node).  WirePlumber is responsible for
- * routing that stream to whichever sink the user has configured as default.
- * OwnTone never enumerates PipeWire sinks for the purpose of *streaming* to
- * them; device selection there is entirely delegated to WirePlumber.
+ * OwnTone currently registers a single "PipeWire" output device whose
+ * sessions use the default target (PW_ID_ANY).  WirePlumber is responsible
+ * for routing those streams to whichever sink the user has configured as
+ * default.  The streaming connection also observes sinks and can internally
+ * resolve a stable sink ID to its current PipeWire global ID, ready for
+ * future per-sink output publication.
  *
  * All streaming PipeWire interaction happens inside the pw_thread_loop
  * thread (the "PW thread").  The OwnTone player thread calls into this
@@ -395,10 +396,25 @@ pipewire_mixer_is_pwsink(void)
 
 /* ----------------------------- SESSION ------------------------------------ */
 
+enum pipewire_stream_target_type
+{
+  PIPEWIRE_STREAM_TARGET_DEFAULT,
+  PIPEWIRE_STREAM_TARGET_SINK,
+};
+
+struct pipewire_stream_target
+{
+  enum pipewire_stream_target_type type;
+  uint64_t stable_id;
+};
+
 struct pipewire_session
 {
   uint64_t device_id;
   int      callback_id;
+
+  /* Stable target identity; a transient PipeWire global ID is never cached. */
+  struct pipewire_stream_target target;
 
   struct pw_stream      *stream;
   struct spa_hook        stream_listener;
@@ -927,6 +943,8 @@ pipewire_session_make(struct output_device *device, int callback_id)
   ps->device_id   = device->id;
   ps->callback_id = callback_id;
   ps->stream_volume = 1.0f;
+  ps->target.type = PIPEWIRE_STREAM_TARGET_DEFAULT;
+  ps->target.stable_id = 0;
 
   ps->next = sessions;
   sessions = ps;
@@ -1762,6 +1780,74 @@ pipewire_registry_init(void)
   return 0;
 }
 
+/*
+ * Resolve a stable sink identity to the registry's current runtime handle.
+ *
+ * pwctx.observed_sinks is owned by the PipeWire thread. Callers must either
+ * execute on that thread or hold pwctx.thread_loop's lock. If requested,
+ * stable_key is a borrowed pointer: it is valid only while the same ownership
+ * is retained and until the observed-sink list is changed or cleared.
+ */
+static int
+pipewire_observed_sink_resolve(uint64_t stable_id, uint32_t *global_id,
+                               const char **stable_key)
+{
+  struct pipewire_observed_sink *sink;
+
+  if (stable_id == 0 || !global_id)
+    return -1;
+
+  for (sink = pwctx.observed_sinks; sink; sink = sink->next)
+    {
+      if (sink->stable_id != stable_id)
+        continue;
+
+      *global_id = sink->global_id;
+      if (stable_key)
+        *stable_key = sink->stable_key;
+      return 0;
+    }
+
+  return -1;
+}
+
+/* Must be called with pwctx.thread_loop locked (see resolver contract above). */
+static int
+pipewire_stream_target_resolve(const struct pipewire_session *ps,
+                               uint32_t *target_id)
+{
+  const char *stable_key;
+
+  if (!ps || !target_id)
+    return -1;
+
+  switch (ps->target.type)
+    {
+      case PIPEWIRE_STREAM_TARGET_DEFAULT:
+        *target_id = PW_ID_ANY;
+        return 0;
+
+      case PIPEWIRE_STREAM_TARGET_SINK:
+        if (pipewire_observed_sink_resolve(ps->target.stable_id, target_id,
+                                           &stable_key) < 0)
+          {
+            DPRINTF(E_LOG, L_LAUDIO,
+              "PipeWire targeted sink unavailable: stable_id=%" PRIu64 "\n",
+              ps->target.stable_id);
+            return -1;
+          }
+
+        DPRINTF(E_DBG, L_LAUDIO,
+          "PipeWire targeted sink resolved: stable_id=%" PRIu64 " global_id=%u node.name='%s'\n",
+          ps->target.stable_id, *target_id, stable_key);
+        return 0;
+    }
+
+  DPRINTF(E_LOG, L_LAUDIO,
+    "PipeWire stream has invalid target type: %d\n", ps->target.type);
+  return -1;
+}
+
 /* ----------------------- CORE CALLBACKS (PW THREAD) ----------------------- */
 
 static void
@@ -2252,12 +2338,10 @@ pwsink_free(void)
 
 /*
  * Open (or reopen) a PipeWire stream for the given session and quality.
- * The stream is created with PW_ID_ANY so WirePlumber routes it to the
- * default sink; OwnTone does not select a target node for streaming
- * purposes (independent of, and not to be confused with, the sink resolved
- * for pwsink volume control on the separate pwsinkctx connection above --
- * the stream always follows whatever WirePlumber's routing policy decides,
- * even if pwsink_target pins volume control to a specific node).
+ * Default sessions use PW_ID_ANY and follow WirePlumber's routing policy.
+ * Targeted sessions resolve their stable ID against the current registry on
+ * every open, including reconnects, and never fall back to the default sink.
+ * This target is independent of pwsink volume control and its pwsinkctx.
  */
 static int
 stream_open(struct pipewire_session *ps, const struct media_quality *quality)
@@ -2266,12 +2350,19 @@ stream_open(struct pipewire_session *ps, const struct media_quality *quality)
   struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
   const struct spa_pod *params[1];
   struct pw_properties *props;
+  uint32_t target_id;
   int ret;
 
   DPRINTF(E_DBG, L_LAUDIO, "Opening PipeWire stream (%d/%d/%d)\n",
     quality->sample_rate, quality->bits_per_sample, quality->channels);
 
   pw_thread_loop_lock(pwctx.thread_loop);
+
+  if (pipewire_stream_target_resolve(ps, &target_id) < 0)
+    {
+      pw_thread_loop_unlock(pwctx.thread_loop);
+      return -1;
+    }
 
   props = pw_properties_new(
     PW_KEY_MEDIA_TYPE,     "Audio",
@@ -2309,14 +2400,10 @@ stream_open(struct pipewire_session *ps, const struct media_quality *quality)
 
   params[0] = build_format_param(&b, quality);
 
-  /*
-   * Connect with PW_ID_ANY -- no explicit target node.  WirePlumber will
-   * link this stream to the session-manager's default audio sink
-   * automatically.
-   */
+  /* target_id is PW_ID_ANY for every session created by today's public API. */
   ret = pw_stream_connect(ps->stream,
     PW_DIRECTION_OUTPUT,
-    PW_ID_ANY,
+    target_id,
     PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS,
     params, 1);
 
