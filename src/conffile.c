@@ -146,6 +146,7 @@ static cfg_opt_t sec_audio[] =
     CFG_STR("mixer_device", NULL, CFGF_NONE),
     CFG_STR("pwsink_target", NULL, CFGF_NONE),
     CFG_STR("pwsink_volume_curve", "cubic", CFGF_NONE),
+    CFG_BOOL("pipewire_multisink", cfg_false, CFGF_NONE),
     CFG_BOOL("sync_disable", cfg_false, CFGF_NONE),
     CFG_INT("offset", 0, CFGF_DEPRECATED),
     CFG_INT("offset_ms", 0, CFGF_DEPRECATED),

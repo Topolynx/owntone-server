@@ -21,12 +21,11 @@
  *
  * Architecture overview
  * ---------------------
- * OwnTone currently registers a single "PipeWire" output device whose
- * sessions use the default target (PW_ID_ANY).  WirePlumber is responsible
- * for routing those streams to whichever sink the user has configured as
- * default.  The streaming connection also observes sinks and can internally
- * resolve a stable sink ID to its current PipeWire global ID, ready for
- * future per-sink output publication.
+ * By default OwnTone registers a single "PipeWire" output device whose
+ * sessions use the default target (PW_ID_ANY), leaving routing to
+ * WirePlumber. With pipewire_multisink enabled, the streaming connection
+ * publishes each observed sink under a stable OwnTone ID and resolves that
+ * ID to the current PipeWire global ID whenever a stream is opened.
  *
  * All streaming PipeWire interaction happens inside the pw_thread_loop
  * thread (the "PW thread").  The OwnTone player thread calls into this
@@ -86,6 +85,7 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <inttypes.h>
 #include <math.h>
 
@@ -337,6 +337,8 @@ enum pipewire_mixer_mode
 };
 
 static enum pipewire_mixer_mode pipewire_mixer_mode = PIPEWIRE_MIXER_DEFAULT;
+static bool pipewire_multisink;
+static int pipewire_offset_ms;
 
 /*
  * Volume curve used for pwsink mode, selected via "pwsink_volume_curve" in
@@ -419,6 +421,7 @@ struct pipewire_session
 {
   uint64_t device_id;
   int      callback_id;
+  atomic_bool shutdown_pending;
 
   /* Stable target identity; a transient PipeWire global ID is never cached. */
   struct pipewire_stream_target target;
@@ -434,8 +437,8 @@ struct pipewire_session
    * re-applied every time the stream (re)connects -- otherwise a reconnect
    * (e.g. on a quality change via playback_restart()) would leave the new
    * stream instance at PipeWire's own default volume until the next
-   * explicit volume() call.  Defaults to 1.0 (unity) so a stream that's
-   * never had an explicit volume command starts at full scale.
+   * explicit volume() call. Legacy mode defaults to 1.0 (unity); multisink
+   * mode starts from that output's persisted OwnTone volume.
    */
   float    stream_volume;
 
@@ -479,6 +482,8 @@ extern struct event_base *evbase_player;
 static struct pipewire_session *sessions;
 
 static struct media_quality pipewire_fallback_quality = { 44100, 16, 2, 0 };
+
+static void stream_close(struct pipewire_session *ps);
 
 /* ----------------------------- HELPERS ------------------------------------ */
 
@@ -915,6 +920,7 @@ pipewire_session_free(struct pipewire_session *ps)
 static void
 pipewire_session_cleanup(struct pipewire_session *ps)
 {
+  struct output_device *device;
   struct pipewire_session *p;
 
   if (ps == sessions)
@@ -931,6 +937,17 @@ pipewire_session_cleanup(struct pipewire_session *ps)
     }
 
   outputs_device_session_remove(ps->device_id);
+
+  /*
+   * player_device_remove() keeps an unadvertised device alive while its
+   * session is active. A spontaneous targeted-stream failure may not have a
+   * pending output callback, so complete that deferred removal here, on the
+   * player thread, after detaching the session.
+   */
+  device = outputs_device_get(ps->device_id);
+  if (device && device->type == OUTPUT_TYPE_PIPEWIRE && !device->advertised)
+    outputs_device_remove(device);
+
   pipewire_session_free(ps);
 }
 
@@ -952,9 +969,21 @@ pipewire_session_make(struct output_device *device, int callback_id)
   ps->state       = PW_STREAM_STATE_UNCONNECTED;
   ps->device_id   = device->id;
   ps->callback_id = callback_id;
-  ps->stream_volume = 1.0f;
-  ps->target.type = PIPEWIRE_STREAM_TARGET_DEFAULT;
-  ps->target.stable_id = 0;
+  ps->stream_volume = pipewire_multisink
+    ? pct_to_volume(device->volume, PIPEWIRE_CURVE_LINEAR)
+    : 1.0f;
+  atomic_init(&ps->shutdown_pending, false);
+
+  if (pipewire_multisink)
+    {
+      ps->target.type = PIPEWIRE_STREAM_TARGET_SINK;
+      ps->target.stable_id = device->id;
+    }
+  else
+    {
+      ps->target.type = PIPEWIRE_STREAM_TARGET_DEFAULT;
+      ps->target.stable_id = 0;
+    }
 
   ps->next = sessions;
   sessions = ps;
@@ -1020,20 +1049,116 @@ pipewire_status(struct pipewire_session *ps)
 static void
 pipewire_session_shutdown(struct pipewire_session *ps)
 {
-  commands_exec_async(pwctx.cmdbase, session_shutdown, ps);
+  if (atomic_exchange_explicit(&ps->shutdown_pending, true,
+                               memory_order_acq_rel))
+    return;
+
+  if (commands_exec_async(pwctx.cmdbase, session_shutdown, ps) < 0)
+    atomic_store_explicit(&ps->shutdown_pending, false, memory_order_release);
 }
 
-static void
-pipewire_session_shutdown_all(enum pw_stream_state state)
+/*
+ * Runs on the player thread. Registry callbacks only pass the stable ID
+ * across threads; they never walk the player-owned session list directly.
+ * Closing the stream removes its listener before destroying it, so a target
+ * removal cannot race a second shutdown callback for the same session.
+ */
+static enum command_state
+pipewire_targeted_sessions_shutdown(void *arg, int *retval)
 {
+  uint64_t stable_id = *(uint64_t *)arg;
   struct pipewire_session *ps;
   struct pipewire_session *next;
 
   for (ps = sessions; ps; ps = next)
     {
       next = ps->next;
-      ps->state = state;
+
+      if (ps->target.type != PIPEWIRE_STREAM_TARGET_SINK
+          || ps->target.stable_id != stable_id)
+        continue;
+
+      DPRINTF(E_LOG, L_LAUDIO,
+        "PipeWire: targeted sink removed; shutting down session (stable_id=%" PRIu64 ")\n",
+        stable_id);
+      stream_close(ps);
+      ps->state = PW_STREAM_STATE_ERROR;
       pipewire_session_shutdown(ps);
+    }
+
+  *retval = 0;
+  return COMMAND_END;
+}
+
+static void
+pipewire_targeted_sessions_shutdown_schedule(uint64_t stable_id)
+{
+  uint64_t *arg;
+
+  arg = malloc(sizeof(*arg));
+  if (!arg)
+    {
+      DPRINTF(E_LOG, L_LAUDIO,
+        "PipeWire: out of memory scheduling session shutdown for stable_id=%" PRIu64 "\n",
+        stable_id);
+      return;
+    }
+
+  *arg = stable_id;
+  if (commands_exec_async(pwctx.cmdbase,
+                          pipewire_targeted_sessions_shutdown, arg) < 0)
+    {
+      DPRINTF(E_LOG, L_LAUDIO,
+        "PipeWire: could not schedule session shutdown for stable_id=%" PRIu64 "\n",
+        stable_id);
+      free(arg);
+    }
+}
+
+struct pipewire_shutdown_all_arg
+{
+  enum pw_stream_state state;
+};
+
+/* Runs on the player thread; sessions is owned and traversed only there. */
+static enum command_state
+pipewire_sessions_shutdown_all(void *arg, int *retval)
+{
+  const struct pipewire_shutdown_all_arg *shutdown = arg;
+  struct pipewire_session *ps;
+  struct pipewire_session *next;
+
+  for (ps = sessions; ps; ps = next)
+    {
+      next = ps->next;
+      ps->state = shutdown->state;
+      pipewire_session_shutdown(ps);
+    }
+
+  *retval = 0;
+  return COMMAND_END;
+}
+
+static void
+pipewire_sessions_shutdown_all_schedule(enum pw_stream_state state)
+{
+  struct pipewire_shutdown_all_arg *arg;
+
+  arg = malloc(sizeof(*arg));
+  if (!arg)
+    {
+      DPRINTF(E_LOG, L_LAUDIO,
+        "PipeWire: out of memory scheduling shutdown of all sessions\n");
+      return;
+    }
+
+  arg->state = state;
+  if (commands_exec_async(pwctx.cmdbase, pipewire_sessions_shutdown_all,
+                          arg) < 0)
+    {
+      DPRINTF(E_LOG, L_LAUDIO,
+        "PipeWire: could not schedule shutdown of all sessions\n");
+      free(arg);
     }
 }
 
@@ -1593,6 +1718,102 @@ static const struct pw_device_events device_events = {
 /* ---------------- STREAMING REGISTRY OBSERVATION (PW THREAD) ------------- */
 
 static void
+pipewire_output_add(const struct pipewire_observed_sink *sink)
+{
+  struct output_device *device;
+
+  device = calloc(1, sizeof(*device));
+  if (!device)
+    {
+      DPRINTF(E_LOG, L_LAUDIO,
+        "PipeWire: out of memory publishing sink stable_id=%" PRIu64 "\n",
+        sink->stable_id);
+      return;
+    }
+
+  device->name = strdup(sink->display_name);
+  if (!device->name)
+    {
+      DPRINTF(E_LOG, L_LAUDIO,
+        "PipeWire: out of memory copying output name for stable_id=%" PRIu64 "\n",
+        sink->stable_id);
+      free(device);
+      return;
+    }
+
+  device->id                = sink->stable_id;
+  device->type              = OUTPUT_TYPE_PIPEWIRE;
+  device->type_name         = outputs_name(OUTPUT_TYPE_PIPEWIRE);
+  device->supported_formats = MEDIA_FORMAT_PCM;
+  device->offset_ms         = pipewire_offset_ms;
+
+  DPRINTF(E_LOG, L_LAUDIO,
+    "PipeWire: publishing sink output stable_id=%" PRIu64 " node.name='%s' display='%s'\n",
+    sink->stable_id, sink->stable_key, sink->display_name);
+
+  if (player_device_add(device) < 0)
+    {
+      DPRINTF(E_LOG, L_LAUDIO,
+        "PipeWire: failed to schedule output add for stable_id=%" PRIu64 "\n",
+        sink->stable_id);
+      free(device->name);
+      free(device);
+    }
+}
+
+static void
+pipewire_output_remove(const struct pipewire_observed_sink *sink)
+{
+  struct output_device *device;
+
+  device = calloc(1, sizeof(*device));
+  if (!device)
+    {
+      DPRINTF(E_LOG, L_LAUDIO,
+        "PipeWire: out of memory removing sink output stable_id=%" PRIu64 "\n",
+        sink->stable_id);
+      return;
+    }
+
+  device->name = strdup(sink->display_name);
+  if (!device->name)
+    {
+      DPRINTF(E_LOG, L_LAUDIO,
+        "PipeWire: out of memory copying removed output name for stable_id=%" PRIu64 "\n",
+        sink->stable_id);
+      free(device);
+      return;
+    }
+
+  device->id        = sink->stable_id;
+  device->type      = OUTPUT_TYPE_PIPEWIRE;
+  device->type_name = outputs_name(OUTPUT_TYPE_PIPEWIRE);
+
+  DPRINTF(E_LOG, L_LAUDIO,
+    "PipeWire: unpublishing sink output stable_id=%" PRIu64 " node.name='%s'\n",
+    sink->stable_id, sink->stable_key);
+
+  if (player_device_remove(device) < 0)
+    {
+      DPRINTF(E_LOG, L_LAUDIO,
+        "PipeWire: failed to schedule output removal for stable_id=%" PRIu64 "\n",
+        sink->stable_id);
+      free(device->name);
+      free(device);
+    }
+}
+
+static void
+pipewire_observed_sink_unpublish(const struct pipewire_observed_sink *sink)
+{
+  if (!pipewire_multisink)
+    return;
+
+  pipewire_targeted_sessions_shutdown_schedule(sink->stable_id);
+  pipewire_output_remove(sink);
+}
+
+static void
 pipewire_observed_sink_free(struct pipewire_observed_sink *sink)
 {
   if (!sink)
@@ -1604,7 +1825,7 @@ pipewire_observed_sink_free(struct pipewire_observed_sink *sink)
 }
 
 static void
-pipewire_observed_sinks_clear(void)
+pipewire_observed_sinks_clear(bool unpublish)
 {
   struct pipewire_observed_sink *sink;
   struct pipewire_observed_sink *next;
@@ -1612,6 +1833,8 @@ pipewire_observed_sinks_clear(void)
   for (sink = pwctx.observed_sinks; sink; sink = next)
     {
       next = sink->next;
+      if (unpublish)
+        pipewire_observed_sink_unpublish(sink);
       pipewire_observed_sink_free(sink);
     }
 
@@ -1619,7 +1842,7 @@ pipewire_observed_sinks_clear(void)
 }
 
 static void
-pipewire_registry_clear(void)
+pipewire_registry_clear(bool unpublish)
 {
   if (pwctx.registry)
     {
@@ -1628,7 +1851,7 @@ pipewire_registry_clear(void)
       pwctx.registry = NULL;
     }
 
-  pipewire_observed_sinks_clear();
+  pipewire_observed_sinks_clear(unpublish);
 }
 
 static void
@@ -1735,6 +1958,9 @@ on_pwctx_registry_global(void *data, uint32_t id, uint32_t permissions,
   DPRINTF(E_LOG, L_LAUDIO,
     "PipeWire sink discovered: global_id=%u stable_id=%" PRIu64 " node.name='%s' display='%s'\n",
     sink->global_id, sink->stable_id, sink->stable_key, sink->display_name);
+
+  if (pipewire_multisink)
+    pipewire_output_add(sink);
 }
 
 static void
@@ -1765,6 +1991,7 @@ on_pwctx_registry_global_remove(void *data, uint32_t id)
     "PipeWire sink removed: global_id=%u stable_id=%" PRIu64 " node.name='%s' display='%s'\n",
     sink->global_id, sink->stable_id, sink->stable_key, sink->display_name);
 
+  pipewire_observed_sink_unpublish(sink);
   pipewire_observed_sink_free(sink);
 }
 
@@ -1910,7 +2137,7 @@ pipewire_core_reconnect(void)
   /* Tear down stale core */
   if (pwctx.core)
     {
-      pipewire_registry_clear();
+      pipewire_registry_clear(true);
       spa_hook_remove(&pwctx.core_listener);
       pw_core_disconnect(pwctx.core);
       pwctx.core = NULL;
@@ -2028,7 +2255,7 @@ on_core_error(void *userdata, uint32_t id, int seq, int res, const char *message
        * This only affects the streaming connection; the separate pwsink
        * connection (if any) is unaffected and recovers independently.
        */
-      pipewire_session_shutdown_all(PW_STREAM_STATE_ERROR);
+      pipewire_sessions_shutdown_all_schedule(PW_STREAM_STATE_ERROR);
       pw_thread_loop_signal(pwctx.thread_loop, false);
 
       if (!pwctx.reconnect_pending && pwctx.reconnect_ev)
@@ -2256,7 +2483,7 @@ pipewire_free(void)
   /* spa_hook_remove + pw_proxy_destroy must be called while the thread loop
    * is stopped (so no concurrent callbacks) but before pw_core_disconnect
    * (which invalidates all proxies). */
-  pipewire_registry_clear();
+  pipewire_registry_clear(false);
 
   if (pwctx.core)
     {
@@ -2421,7 +2648,7 @@ stream_open(struct pipewire_session *ps, const struct media_quality *quality)
 
   params[0] = build_format_param(&b, quality);
 
-  /* target_id is PW_ID_ANY for every session created by today's public API. */
+  /* Legacy sessions use PW_ID_ANY; multisink sessions use the resolved ID. */
   ret = pw_stream_connect(ps->stream,
     PW_DIRECTION_OUTPUT,
     target_id,
@@ -2982,7 +3209,6 @@ pipewire_init(void)
   char *mixer;
   char *target;
   char *curve;
-  int offset_ms;
   int ret;
 
   cfg_audio = cfg_getsec(cfg, "audio");
@@ -3008,6 +3234,24 @@ pipewire_init(void)
         "PipeWire: unrecognized mixer '%s' (expected 'pwsink' or 'pwstream'), using OwnTone's default volume behaviour\n",
         mixer);
       pipewire_mixer_mode = PIPEWIRE_MIXER_DEFAULT;
+    }
+
+  pipewire_multisink = cfg_getbool(cfg_audio, "pipewire_multisink");
+  if (pipewire_multisink
+      && pipewire_mixer_mode != PIPEWIRE_MIXER_PWSTREAM)
+    {
+      DPRINTF(E_LOG, L_LAUDIO,
+        "PipeWire: pipewire_multisink requires mixer = 'pwstream'; refusing to initialise\n");
+      return -1;
+    }
+
+  pipewire_offset_ms = cfg_getint(cfg_audio, "offset_ms");
+  if (abs(pipewire_offset_ms) > 1000)
+    {
+      DPRINTF(E_LOG, L_LAUDIO,
+        "PipeWire offset_ms (%d) is out of bounds (-1000 -> 1000)\n",
+        pipewire_offset_ms);
+      pipewire_offset_ms = 0;
     }
 
   /*
@@ -3038,13 +3282,14 @@ pipewire_init(void)
     }
 
   DPRINTF(E_LOG, L_LAUDIO,
-    "PipeWire: volume control mode is '%s'%s%s, curve is '%s'\n",
+    "PipeWire: volume control mode is '%s'%s%s, curve is '%s', multisink is %s\n",
     (pipewire_mixer_mode == PIPEWIRE_MIXER_PWSINK)   ? "pwsink"   :
     (pipewire_mixer_mode == PIPEWIRE_MIXER_PWSTREAM) ? "pwstream" :
                                                         "default (none)",
     pwsinkctx.configured_target[0] ? ", target=" : "",
     pwsinkctx.configured_target[0] ? pwsinkctx.configured_target : "",
-    (pipewire_volume_curve == PIPEWIRE_CURVE_CUBIC) ? "cubic" : "linear");
+    (pipewire_volume_curve == PIPEWIRE_CURVE_CUBIC) ? "cubic" : "linear",
+    pipewire_multisink ? "enabled" : "disabled");
 
   pw_init(NULL, NULL);
 
@@ -3125,34 +3370,27 @@ pipewire_init(void)
       "PipeWire: pwsink connection failed to initialise -- volume control "
       "will not work until this is resolved\n");
 
-  /*
-   * Register the single PipeWire output device.  WirePlumber will route our
-   * stream to the default sink; OwnTone does not enumerate sinks itself for
-   * streaming (independent of pwsink volume-control resolution above).
-   */
-  nickname = cfg_getstr(cfg_audio, "nickname");
-  if (!nickname || nickname[0] == '\0')
-    nickname = "PipeWire";
-
-  offset_ms = cfg_getint(cfg_audio, "offset_ms");
-  if (abs(offset_ms) > 1000)
+  if (!pipewire_multisink)
     {
-      DPRINTF(E_LOG, L_LAUDIO, "PipeWire offset_ms (%d) is out of bounds (-1000 -> 1000)\n", offset_ms);
-      offset_ms = 0;
+      /* Legacy mode: keep the single PW_ID_ANY output exactly as before. */
+      nickname = cfg_getstr(cfg_audio, "nickname");
+      if (!nickname || nickname[0] == '\0')
+        nickname = "PipeWire";
+
+      CHECK_NULL(L_LAUDIO, device = calloc(1, sizeof(struct output_device)));
+
+      device->id                = 1;
+      device->name              = strdup(nickname);
+      device->type              = OUTPUT_TYPE_PIPEWIRE;
+      device->type_name         = outputs_name(OUTPUT_TYPE_PIPEWIRE);
+      device->supported_formats = MEDIA_FORMAT_PCM;
+      device->offset_ms         = pipewire_offset_ms;
+
+      player_device_add(device);
     }
 
-  CHECK_NULL(L_LAUDIO, device = calloc(1, sizeof(struct output_device)));
-
-  device->id               = 1; /* Fixed ID for the single PipeWire device */
-  device->name             = strdup(nickname);
-  device->type             = OUTPUT_TYPE_PIPEWIRE;
-  device->type_name        = outputs_name(OUTPUT_TYPE_PIPEWIRE);
-  device->supported_formats = MEDIA_FORMAT_PCM;
-  device->offset_ms        = offset_ms;
-
-  player_device_add(device);
-
-  DPRINTF(E_LOG, L_LAUDIO, "PipeWire output initialised\n");
+  DPRINTF(E_LOG, L_LAUDIO, "PipeWire output initialised (%s mode)\n",
+    pipewire_multisink ? "multisink" : "legacy");
 
   return 0;
 

@@ -293,6 +293,12 @@ audio {
 	# Defaults to "cubic".
 #	pwsink_volume_curve = "cubic"
 
+	# Publish each PipeWire Audio/Sink as an independent OwnTone output.
+	# This is opt-in and requires mixer = "pwstream". When disabled, OwnTone
+	# keeps the single legacy output and lets WirePlumber route it to the
+	# default sink.
+#	pipewire_multisink = false
+
 	# Enable or disable audio resampling to keep local audio in sync with
 	# e.g. Airplay. This feature relies on accurate ALSA measurements of
 	# delay, and some devices don't provide that. If that is the case you
