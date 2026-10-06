@@ -408,6 +408,13 @@ struct pipewire_stream_target
   uint64_t stable_id;
 };
 
+enum pipewire_stream_open_result
+{
+  PIPEWIRE_STREAM_OPEN_OK,
+  PIPEWIRE_STREAM_OPEN_ERROR,
+  PIPEWIRE_STREAM_OPEN_TARGET_UNAVAILABLE,
+};
+
 struct pipewire_session
 {
   uint64_t device_id;
@@ -432,6 +439,10 @@ struct pipewire_session
    */
   float    stream_volume;
 
+  /* Last input quality received from OwnTone, used for restart decisions. */
+  struct media_quality input_quality;
+
+  /* Effective stream quality, which may be pipewire_fallback_quality. */
   struct media_quality quality;
 
   int      logcount;
@@ -467,7 +478,6 @@ extern struct event_base *evbase_player;
 /* Active sessions list */
 static struct pipewire_session *sessions;
 
-static struct media_quality pipewire_last_quality;
 static struct media_quality pipewire_fallback_quality = { 44100, 16, 2, 0 };
 
 /* ----------------------------- HELPERS ------------------------------------ */
@@ -1862,7 +1872,8 @@ on_core_done(void *userdata, uint32_t id, int seq)
 
 /* Forward declarations -- pipewire_core_reconnect() references both of these
  * which are defined later in this file */
-static int stream_open(struct pipewire_session *ps, const struct media_quality *quality);
+static enum pipewire_stream_open_result
+stream_open(struct pipewire_session *ps, const struct media_quality *quality);
 static const struct pw_core_events core_events;
 
 /*
@@ -1890,7 +1901,7 @@ static void
 pipewire_core_reconnect(void)
 {
   struct pipewire_session *ps;
-  int ret;
+  enum pipewire_stream_open_result result;
 
   DPRINTF(E_LOG, L_LAUDIO, "PipeWire: attempting stream reconnect to daemon after sleep/wake\n");
 
@@ -1964,8 +1975,16 @@ pipewire_core_reconnect(void)
       DPRINTF(E_LOG, L_LAUDIO,
         "PipeWire: re-opening stream for session after reconnect\n");
 
-      ret = stream_open(ps, &ps->quality);
-      if (ret < 0)
+      result = stream_open(ps, &ps->quality);
+      if (result == PIPEWIRE_STREAM_OPEN_TARGET_UNAVAILABLE)
+        {
+          DPRINTF(E_LOG, L_LAUDIO,
+            "PipeWire: targeted sink unavailable after reconnect; shutting down session (stable_id=%" PRIu64 ")\n",
+            ps->target.stable_id);
+          ps->state = PW_STREAM_STATE_ERROR;
+          pipewire_session_shutdown(ps);
+        }
+      else if (result != PIPEWIRE_STREAM_OPEN_OK)
         {
           DPRINTF(E_LOG, L_LAUDIO,
             "PipeWire: failed to re-open stream after reconnect\n");
@@ -2343,7 +2362,7 @@ pwsink_free(void)
  * every open, including reconnects, and never fall back to the default sink.
  * This target is independent of pwsink volume control and its pwsinkctx.
  */
-static int
+static enum pipewire_stream_open_result
 stream_open(struct pipewire_session *ps, const struct media_quality *quality)
 {
   uint8_t buf[1024];
@@ -2361,7 +2380,9 @@ stream_open(struct pipewire_session *ps, const struct media_quality *quality)
   if (pipewire_stream_target_resolve(ps, &target_id) < 0)
     {
       pw_thread_loop_unlock(pwctx.thread_loop);
-      return -1;
+      if (ps->target.type == PIPEWIRE_STREAM_TARGET_SINK)
+        return PIPEWIRE_STREAM_OPEN_TARGET_UNAVAILABLE;
+      return PIPEWIRE_STREAM_OPEN_ERROR;
     }
 
   props = pw_properties_new(
@@ -2375,7 +2396,7 @@ stream_open(struct pipewire_session *ps, const struct media_quality *quality)
     {
       DPRINTF(E_LOG, L_LAUDIO, "PipeWire could not allocate stream properties\n");
       pw_thread_loop_unlock(pwctx.thread_loop);
-      return -1;
+      return PIPEWIRE_STREAM_OPEN_ERROR;
     }
 
   /*
@@ -2393,7 +2414,7 @@ stream_open(struct pipewire_session *ps, const struct media_quality *quality)
     {
       DPRINTF(E_LOG, L_LAUDIO, "PipeWire could not create stream\n");
       pw_thread_loop_unlock(pwctx.thread_loop);
-      return -1;
+      return PIPEWIRE_STREAM_OPEN_ERROR;
     }
 
   pw_stream_add_listener(ps->stream, &ps->stream_listener, &stream_events, ps);
@@ -2414,7 +2435,7 @@ stream_open(struct pipewire_session *ps, const struct media_quality *quality)
       pw_stream_destroy(ps->stream);
       ps->stream = NULL;
       pw_thread_loop_unlock(pwctx.thread_loop);
-      return -1;
+      return PIPEWIRE_STREAM_OPEN_ERROR;
     }
 
   ps->quality = *quality;
@@ -2440,7 +2461,7 @@ stream_open(struct pipewire_session *ps, const struct media_quality *quality)
             pw_stream_destroy(ps->stream);
             ps->stream = NULL;
             pw_thread_loop_unlock(pwctx.thread_loop);
-            return -1;
+            return PIPEWIRE_STREAM_OPEN_ERROR;
           }
         ps->ring          = newring;
         ps->ring_capacity = want_capacity;
@@ -2451,7 +2472,7 @@ stream_open(struct pipewire_session *ps, const struct media_quality *quality)
   }
 
   pw_thread_loop_unlock(pwctx.thread_loop);
-  return 0;
+  return PIPEWIRE_STREAM_OPEN_OK;
 }
 
 static void
@@ -2478,21 +2499,41 @@ stream_close(struct pipewire_session *ps)
 static void
 playback_restart(struct pipewire_session *ps, struct output_buffer *obuf)
 {
-  int ret;
+  enum pipewire_stream_open_result result;
 
   stream_close(ps);
 
-  ps->quality = obuf->data[0].quality;
-  ret = stream_open(ps, &ps->quality);
-  if (ret < 0)
+  ps->input_quality = obuf->data[0].quality;
+  result = stream_open(ps, &ps->input_quality);
+  if (result == PIPEWIRE_STREAM_OPEN_TARGET_UNAVAILABLE)
+    {
+      DPRINTF(E_LOG, L_LAUDIO,
+        "PipeWire: targeted sink unavailable; shutting down session (stable_id=%" PRIu64 ")\n",
+        ps->target.stable_id);
+      ps->state = PW_STREAM_STATE_ERROR;
+      pipewire_session_shutdown(ps);
+      return;
+    }
+
+  if (result == PIPEWIRE_STREAM_OPEN_ERROR)
     {
       DPRINTF(E_INFO, L_LAUDIO,
         "PipeWire: input quality (%d/%d/%d) not supported, falling back\n",
-        ps->quality.sample_rate, ps->quality.bits_per_sample, ps->quality.channels);
+        ps->input_quality.sample_rate, ps->input_quality.bits_per_sample,
+        ps->input_quality.channels);
 
-      ps->quality = pipewire_fallback_quality;
-      ret = stream_open(ps, &ps->quality);
-      if (ret < 0)
+      result = stream_open(ps, &pipewire_fallback_quality);
+      if (result == PIPEWIRE_STREAM_OPEN_TARGET_UNAVAILABLE)
+        {
+          DPRINTF(E_LOG, L_LAUDIO,
+            "PipeWire: targeted sink unavailable during fallback; shutting down session (stable_id=%" PRIu64 ")\n",
+            ps->target.stable_id);
+          ps->state = PW_STREAM_STATE_ERROR;
+          pipewire_session_shutdown(ps);
+          return;
+        }
+
+      if (result == PIPEWIRE_STREAM_OPEN_ERROR)
         {
           DPRINTF(E_LOG, L_LAUDIO, "PipeWire device failed on fallback quality\n");
           ps->state = PW_STREAM_STATE_ERROR;
@@ -2780,10 +2821,9 @@ pipewire_write(struct output_buffer *obuf)
       next = ps->next;
 
       if (ps->state == PW_STREAM_STATE_UNCONNECTED
-          || !quality_is_equal(&obuf->data[0].quality, &pipewire_last_quality))
+          || !quality_is_equal(&obuf->data[0].quality, &ps->input_quality))
         {
           playback_restart(ps, obuf);
-          pipewire_last_quality = obuf->data[0].quality;
           continue;
         }
       else if (ps->state == PW_STREAM_STATE_ERROR
